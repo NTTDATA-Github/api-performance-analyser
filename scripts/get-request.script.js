@@ -6,11 +6,11 @@ import { textSummary } from 'https://jslib.k6.io/k6-summary/0.1.0/index.js';
 
 // ----- Test Options -----
 export const options = {
-  vus: {{vus}},
-  duration: '{{duration}}',
+  vus: 10,
+  duration: '30s',
   thresholds: {
-    http_req_duration: ['p(95)<2000'], // 95% of requests must be under 2s
-    checks: ['rate>0.99'], // 99% of checks must pass
+    http_req_duration: ['p(95)<2000'],
+    checks: ['rate>0.99'],
   },
   tags: {
     template: 'dynamic-k6',
@@ -18,13 +18,11 @@ export const options = {
 };
 
 // ----- Custom Metric -----
-const endpoint_duration = new Trend('endpoint_duration');
+const endpoint_duration = new Trend('get_api_duration');
 
 // ----- Helper Function to Parse Payload Safely -----
 function parsePayload(payload) {
-  if (!payload || payload === 'null') {
-    return null;
-  }
+  if (!payload || payload === 'null') return null;
   try {
     return JSON.parse(payload);
   } catch (e) {
@@ -35,36 +33,34 @@ function parsePayload(payload) {
 
 // ----- Main Test -----
 export default function () {
-  const url = '{{url}}';
-  const method = '{{method}}';
-  const payload = parsePayload('{{{payload}}}');
-  const headers = parsePayload('{{{headers}}}'); // Parse headers as JSON
-
-  const params = {
-    headers: headers,
-  };
+  const url = 'https://jsonplaceholder.typicode.com/posts/1';
+  const method = 'GET';
+  const payload = null; // No payload for GET requests
+  const headers = { 'Content-Type': 'application/json' };
+  const params = { headers: headers };
 
   const res = http.request(method, url, payload, params);
   endpoint_duration.add(res.timings.duration);
 
   // ----- Basic Checks -----
   const ok = check(res, {
-    'status is 2xx': (r) => r.status >= 200 && r.status < 300,
-    'content-type is application/json': (r) =>
+    'status is 200': (r) => r.status === 200,
+    'content-type is json': (r) =>
       String(r.headers['Content-Type'] || '').includes('application/json'),
+    'response has "id" field': (r) => r.json().id !== undefined,
   });
 
   if (!ok) {
     console.error(`Test failed for ${method} ${url} - Status: ${res.status}`);
   }
 
-  sleep(1); // Pacing between iterations
+  sleep(1);
 }
 
 // ----- HTML Report -----
 export function handleSummary(data) {
   return {
-    "{{reportPath}}": htmlReport(data, { title: "k6 Dynamic Test" }),
+    "get-api-report.html": htmlReport(data, { title: "k6 GET Test Report" }),
     stdout: textSummary(data, { enableColors: true }),
   };
 }
