@@ -28,7 +28,7 @@ export class K6Service {
   async runTest(dto: CreateTestDto): Promise<Buffer> {
     // Safely stringify and escape the JSON data to prevent syntax errors in the K6 script.
     const escapedHeaders = this.escapeJavaScriptString(JSON.stringify(dto.headers || {}));
-    const escapedPayload = dto.body ? this.escapeJavaScriptString(JSON.stringify(JSON.parse(dto.body))) : 'null';
+    const escapedPayload = dto.body ? this.escapeJavaScriptString(dto.body) : 'null';
     this.logger.log('Generating k6 script content...');
 
     // Reports dir

@@ -9,62 +9,204 @@ export const options = {
   vus: {{vus}},
   duration: '{{duration}}',
   thresholds: {
-    http_req_duration: ['p(95)<2000'], // 95% of requests must be under 2s
-    checks: ['rate>0.99'], // 99% of checks must pass
+    http_req_duration: ['p(95)<2000'], // 95% under 2s
+    http_req_failed: ['rate<0.01'],    // Less than 1% failures
+    checks: ['rate>0.95'],             // 95% checks must pass (more realistic)
   },
   tags: {
-    template: 'dynamic-k6',
+    template: 'dynamic-k6-enhanced',
+    test_type: '{{testType}}',
   },
 };
 
-// ----- Custom Metric -----
+// ----- Custom Metrics -----
 const endpoint_duration = new Trend('endpoint_duration');
+const response_size = new Trend('response_size');
 
-// ----- Helper Function to Parse Payload Safely -----
-function parsePayload(payload) {
-  if (!payload || payload === 'null') {
-    return null;
-  }
+// ----- Helper Functions -----
+function parseOrNull(raw) {
+  if (!raw || raw === 'null' || raw === '') return null;
   try {
-    return JSON.parse(payload);
-  } catch (e) {
-    console.error('Failed to parse payload:', e);
-    return null;
+    return JSON.parse(raw);
+  } catch {
+    return raw; // allow plain string payloads
   }
 }
 
-// ----- Main Test -----
+function isGraphQLRequest(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  return payload.hasOwnProperty('query') || payload.hasOwnProperty('mutation');
+}
+
+function getContentType(headers, payload, method) {
+  // If Content-Type is explicitly set, use it
+  const explicitContentType = headers['Content-Type'] || headers['content-type'];
+  if (explicitContentType) return explicitContentType;
+  
+  // Auto-detect based on payload and method
+  if (method === 'GET' || method === 'DELETE') return null;
+  if (payload && typeof payload === 'object') return 'application/json';
+  if (payload && typeof payload === 'string') {
+    try {
+      JSON.parse(payload);
+      return 'application/json';
+    } catch {
+      return 'text/plain';
+    }
+  }
+  return 'application/json';
+}
+
+function validateGraphQLResponse(response) {
+  try {
+    const body = JSON.parse(response.body);
+    return {
+      hasData: !!body.data,
+      hasErrors: !!(body.errors && body.errors.length > 0),
+      errorCount: body.errors ? body.errors.length : 0,
+    };
+  } catch {
+    return { hasData: false, hasErrors: true, errorCount: 1 };
+  }
+}
+
+// ----- Main Test Function -----
 export default function () {
   const url = '{{url}}';
-  const method = '{{method}}';
-  const payload = parsePayload('{{{payload}}}');
-  const headers = parsePayload('{{{headers}}}'); // Parse headers as JSON
-
-  const params = {
-    headers: headers,
-  };
-
-  const res = http.request(method, url, payload, params);
-  endpoint_duration.add(res.timings.duration);
-
-  // ----- Basic Checks -----
-  const ok = check(res, {
-    'status is 2xx': (r) => r.status >= 200 && r.status < 300,
-    'content-type is application/json': (r) =>
-      String(r.headers['Content-Type'] || '').includes('application/json'),
-  });
-
-  if (!ok) {
-    console.error(`Test failed for ${method} ${url} - Status: ${res.status}`);
+  const method = '{{method}}'.toUpperCase();
+  const rawPayload = parseOrNull(`{{{payload}}}`);
+  const baseHeaders = {{{headers}}};
+  const testType = '{{testType}}' || 'REST';
+  
+  // Prepare headers with auto-detection
+  const headers = { ...baseHeaders };
+  const autoContentType = getContentType(headers, rawPayload, method);
+  if (autoContentType && !headers['Content-Type'] && !headers['content-type']) {
+    headers['Content-Type'] = autoContentType;
   }
 
-  sleep(1); // Pacing between iterations
+  const params = { 
+    headers,
+    timeout: '30s', // Add timeout for better error handling
+  };
+
+  // Prepare body based on method and payload
+  let body = null;
+  if (method !== 'GET' && method !== 'DELETE' && rawPayload) {
+    body = typeof rawPayload === 'string' ? rawPayload : JSON.stringify(rawPayload);
+  }
+
+  // Make the request
+  const res = http.request(method, url, body, params);
+  
+  // Record custom metrics
+  endpoint_duration.add(res.timings.duration);
+  response_size.add(res.body ? res.body.length : 0);
+
+  // Determine if this is a GraphQL request
+  const isGraphQL = testType === 'GRAPHQL' || isGraphQLRequest(rawPayload);
+
+  // ----- Dynamic Checks Based on Request Type -----
+  let checks = {};
+
+  if (isGraphQL) {
+    // GraphQL-specific checks
+    const gqlValidation = validateGraphQLResponse(res);
+    checks = {
+      'GraphQL: status is 200': (r) => r.status === 200,
+      'GraphQL: response is valid JSON': (r) => {
+        try {
+          JSON.parse(r.body);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      'GraphQL: has data or errors field': (r) => {
+        const validation = validateGraphQLResponse(r);
+        return validation.hasData || validation.hasErrors;
+      },
+      'GraphQL: no server errors (5xx)': (r) => r.status < 500,
+    };
+  } else {
+    // REST API checks
+    checks = {
+      'REST: status is successful': (r) => {
+        // Different success criteria based on method
+        switch (method) {
+          case 'GET':
+            return r.status === 200;
+          case 'POST':
+            return r.status === 200 || r.status === 201;
+          case 'PUT':
+            return r.status === 200 || r.status === 204;
+          case 'PATCH':
+            return r.status === 200 || r.status === 204;
+          case 'DELETE':
+            return r.status === 200 || r.status === 204 || r.status === 404;
+          default:
+            return r.status >= 200 && r.status < 300;
+        }
+      },
+      'REST: response time under 5s': (r) => r.timings.duration < 5000,
+      'REST: no server errors (5xx)': (r) => r.status < 500,
+    };
+
+    // Add content-type check for JSON APIs (optional)
+    if (headers['Content-Type'] && headers['Content-Type'].includes('application/json')) {
+      checks['REST: response is JSON'] = (r) => {
+        const contentType = r.headers['Content-Type'] || r.headers['content-type'] || '';
+        return contentType.includes('application/json') || r.status === 204; // 204 No Content is OK
+      };
+    }
+  }
+
+  // Run the checks
+  const ok = check(res, checks);
+
+  // Enhanced error logging
+  if (!ok) {
+    console.error(`Test failed for ${method} ${url}`);
+    console.error(`   Status: ${res.status}`);
+    console.error(`   Duration: ${res.timings.duration}ms`);
+    
+    if (isGraphQL) {
+      const gqlValidation = validateGraphQLResponse(res);
+      if (gqlValidation.hasErrors) {
+        console.error(`   GraphQL Errors: ${gqlValidation.errorCount}`);
+      }
+    }
+    
+    // Truncate long responses for readability
+    const responseBody = res.body || '';
+    if (responseBody.length > 500) {
+      console.error('   Response body (truncated):', responseBody.substring(0, 500) + '...');
+    } else {
+      console.error('   Response body:', responseBody);
+    }
+  } else if (__ENV.DEBUG) {
+    // Optional debug logging when DEBUG=1 is set
+    console.log(`${method} ${url} - ${res.status} (${res.timings.duration}ms)`);
+  }
+
+  // Variable sleep time based on test type
+  const sleepTime = isGraphQL ? 0.5 : 1; // GraphQL can often handle higher throughput
+  sleep(sleepTime);
 }
 
-// ----- HTML Report -----
+// ----- Enhanced HTML Report -----
 export function handleSummary(data) {
+  const testType = '{{testType}}' || 'REST';
+  const reportTitle = `k6 ${testType} API Test Report`;
+  
   return {
-    "{{reportPath}}": htmlReport(data, { title: "k6 Dynamic Test" }),
-    stdout: textSummary(data, { enableColors: true }),
+    "{{reportPath}}": htmlReport(data, { 
+      title: reportTitle,
+      debug: true,
+    }),
+    stdout: textSummary(data, { 
+      enableColors: true,
+      indent: ' ',
+    }),
   };
 }

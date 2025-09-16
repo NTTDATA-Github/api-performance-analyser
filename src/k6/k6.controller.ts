@@ -38,6 +38,7 @@ export class K6Controller {
     description: 'Failed to run k6 test',
   })
   async runTest(@Body() dto: CreateTestDto, @Res() res: Response) {
+    console.log('Received k6 test request:', dto);
     try {
       const htmlReport = await this.k6Service.runTest(dto);
 
