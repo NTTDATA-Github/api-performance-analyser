@@ -12,7 +12,10 @@ export class K6Service {
   constructor(private readonly templateService: TemplateService) {}
 
   // A helper function to safely escape strings for JavaScript
-  private escapeJavaScriptString(str: string): string {
+  private escapeJavaScriptString(str: any): string {
+    if (typeof str !== 'string') {
+      str = String(str);
+    }
     return str
       .replace(/\\/g, '\\\\') // Escapes backslashes
       .replace(/'/g, "\\'")   // Escapes single quotes
@@ -28,7 +31,11 @@ export class K6Service {
   async runTest(dto: CreateTestDto): Promise<Buffer> {
     // Safely stringify and escape the JSON data to prevent syntax errors in the K6 script.
     const escapedHeaders = this.escapeJavaScriptString(JSON.stringify(dto.headers || {}));
-    const escapedPayload = dto.body ? this.escapeJavaScriptString(dto.body) : 'null';
+    let payloadString = 'null';
+    if (dto.body) {
+      payloadString = typeof dto.body === 'object' ? JSON.stringify(dto.body) : String(dto.body);
+    }
+    const escapedPayload = this.escapeJavaScriptString(payloadString);
     this.logger.log('Generating k6 script content...');
 
     // Reports dir
